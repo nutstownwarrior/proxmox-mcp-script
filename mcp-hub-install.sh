@@ -1,27 +1,20 @@
 #!/usr/bin/env bash
-# mcp-hub-install.sh — MCP Hub Container Provisioner
-# Run INSIDE a freshly created Debian 12 LXC container (as root).
+# mcp-hub-install.sh — MCP Hub Docker Compose stack installer
+# Run INSIDE the Docker LXC container (as root).
 #
-# What this script does:
-#   1. Install system dependencies (Node.js 20, nginx, python3, pip, git,
-#      curl, jq, ufw, openssl, cloudflared)
-#   2. Create a low-privilege 'mcp' system user  (/opt/mcp)
-#   3. Clone + build gtasks-mcp
-#   4. Install mcp-proxy  (stdio → HTTP/SSE bridge)
-#   5. Generate a random bearer token
-#   6. Create mcp-gtasks systemd service
-#   7. Configure nginx (port 8080, /gtasks/, bearer auth, SSE, /health)
-#   8. Install /usr/local/bin/add-mcp-server helper
-#   9. Install /opt/mcp/setup-tunnel.sh (Cloudflare Tunnel wizard)
-#  10. Configure UFW (deny all in except SSH + 8080)
-#  11. Enable + start services
-#  12. Write /root/mcp-hub-info.txt summary
+# Sets up a Docker Compose stack with:
+#   - nginx reverse proxy (port 8080, bearer token auth, SSE support)
+#   - gtasks-mcp  (Google Tasks MCP server via mcp-proxy)
+#   - cloudflared (tunnel, started separately via --profile tunnel)
+#
+# Helper tools installed:
+#   - /usr/local/bin/add-mcp-server   add more MCP servers in one command
+#   - /opt/mcp-hub/setup-tunnel.sh    interactive Cloudflare Tunnel wizard
 #
 # No external framework dependencies — fully self-contained.
 
 set -euo pipefail
 
-# ── Colour helpers ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'
 BLU='\033[0;34m'; CYN='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'
 
@@ -30,508 +23,534 @@ msg_ok()    { echo -e "  ${GRN}[✓]${NC} $*"; }
 msg_error() { echo -e "  ${RED}[✗]${NC} $*" >&2; exit 1; }
 msg_warn()  { echo -e "  ${YLW}[!]${NC} $*"; }
 
-# ── Require root ───────────────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && msg_error "This script must be run as root."
+[[ $EUID -ne 0 ]] && msg_error "Run as root."
 
-# ── Header ─────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BLU}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BLU}${BOLD}  MCP Hub — Container Install Script${NC}"
+echo -e "${BLU}${BOLD}  MCP Hub — Docker Compose Stack Installer${NC}"
 echo -e "${BLU}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
-# ── 1. System dependencies ─────────────────────────────────────────────────────
-msg_info "Updating package lists"
-apt-get update -qq
-msg_ok "Package lists updated"
-
-msg_info "Installing base dependencies"
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  curl wget git jq ufw openssl \
-  python3 python3-pip \
-  nginx \
-  lsb-release gnupg2 ca-certificates
-msg_ok "Base dependencies installed"
-
-# ── Node.js 20.x ───────────────────────────────────────────────────────────────
-msg_info "Installing Node.js 20.x"
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash - &>/dev/null
-apt-get install -y -qq nodejs
-msg_ok "Node.js $(node --version) installed"
-
-# ── mcp-proxy (stdio → HTTP/SSE bridge) ───────────────────────────────────────
-msg_info "Installing mcp-proxy"
-pip install --quiet mcp-proxy --break-system-packages
-msg_ok "mcp-proxy installed ($(mcp-proxy --version 2>/dev/null || echo 'ok'))"
-
-# ── cloudflared (latest release from GitHub) ──────────────────────────────────
-msg_info "Installing cloudflared (latest from GitHub)"
-RELEASE=$(curl -fsSL https://api.github.com/repos/cloudflare/cloudflared/releases/latest \
-  | grep '"tag_name"' \
-  | sed -E 's/.*"([^"]+)".*/\1/')
-
-if [[ -z "${RELEASE}" ]]; then
-  msg_warn "Could not determine latest cloudflared release — using fallback 2024.12.2"
-  RELEASE="2024.12.2"
+# ── 1. Verify / install Docker ─────────────────────────────────────────────────
+msg_info "Checking Docker"
+if ! command -v docker &>/dev/null; then
+  msg_warn "Docker not found — installing..."
+  apt-get update -qq
+  apt-get install -y -qq curl ca-certificates gnupg
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/debian/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/debian bookworm stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  apt-get install -y -qq \
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
 fi
+msg_ok "Docker $(docker --version | awk '{print $3}' | tr -d ',')"
 
-ARCH="amd64"
-wget -q "https://github.com/cloudflare/cloudflared/releases/download/${RELEASE}/cloudflared-linux-${ARCH}.deb" \
-  -O /tmp/cloudflared.deb
-dpkg -i /tmp/cloudflared.deb &>/dev/null
-rm -f /tmp/cloudflared.deb
-echo "${RELEASE}" > /opt/cloudflared_version.txt
-msg_ok "cloudflared ${RELEASE} installed"
-
-# ── 2. mcp system user ────────────────────────────────────────────────────────
-msg_info "Creating 'mcp' system user"
-if ! id mcp &>/dev/null; then
-  useradd \
-    --system \
-    --shell /bin/bash \
-    --create-home \
-    --home-dir /opt/mcp \
-    mcp
+# Verify Docker Compose (v2 plugin)
+if ! docker compose version &>/dev/null; then
+  apt-get install -y -qq docker-compose-plugin
 fi
-mkdir -p /opt/mcp
-msg_ok "User 'mcp' created (home: /opt/mcp)"
+msg_ok "Docker Compose $(docker compose version --short)"
 
-# ── 3. gtasks-mcp ─────────────────────────────────────────────────────────────
-msg_info "Cloning gtasks-mcp"
-if [[ -d /opt/mcp/gtasks-mcp ]]; then
-  msg_warn "/opt/mcp/gtasks-mcp already exists — pulling latest"
-  git -C /opt/mcp/gtasks-mcp pull -q
-else
-  git clone -q https://github.com/zcaceres/gtasks-mcp.git /opt/mcp/gtasks-mcp
-fi
-msg_ok "gtasks-mcp cloned"
+# ── 2. Install helpers ────────────────────────────────────────────────────────
+msg_info "Installing system utilities"
+apt-get install -y -qq curl jq ufw openssl python3
+msg_ok "Utilities installed"
 
-msg_info "Building gtasks-mcp (npm install + build)"
-cd /opt/mcp/gtasks-mcp
-npm install --silent
-npm run build --silent
-chown -R mcp:mcp /opt/mcp
-msg_ok "gtasks-mcp built"
+# ── 3. Project structure ──────────────────────────────────────────────────────
+HUB="/opt/mcp-hub"
+msg_info "Creating project structure at ${HUB}"
+mkdir -p \
+  "${HUB}/nginx" \
+  "${HUB}/services/gtasks/data" \
+  "${HUB}/cloudflared" \
+  "${HUB}/scripts"
+msg_ok "Directory structure created"
 
-# ── 5. Bearer token ───────────────────────────────────────────────────────────
+# ── 4. Bearer token ───────────────────────────────────────────────────────────
 msg_info "Generating bearer token"
 BEARER_TOKEN=$(openssl rand -hex 32)
-echo "${BEARER_TOKEN}" > /opt/mcp/.bearer_token
-chmod 600 /opt/mcp/.bearer_token
-chown mcp:mcp /opt/mcp/.bearer_token
-msg_ok "Bearer token saved to /opt/mcp/.bearer_token"
+echo "${BEARER_TOKEN}" > "${HUB}/.bearer_token"
+chmod 600 "${HUB}/.bearer_token"
+msg_ok "Bearer token saved to ${HUB}/.bearer_token"
 
-# ── Resolve binary paths (for use in service files) ───────────────────────────
-MCP_PROXY_BIN=$(command -v mcp-proxy)
-NODE_BIN=$(command -v node)
+# ── 5. gtasks-mcp Dockerfile ──────────────────────────────────────────────────
+msg_info "Creating gtasks-mcp Dockerfile"
+cat > "${HUB}/services/gtasks/Dockerfile" <<'DOCKERFILE'
+FROM node:20-slim
 
-# ── 6. systemd: mcp-gtasks ────────────────────────────────────────────────────
-msg_info "Creating mcp-gtasks systemd service"
-cat > /etc/systemd/system/mcp-gtasks.service <<EOF
-[Unit]
-Description=gtasks MCP Server (mcp-proxy → stdio bridge)
-After=network.target
+# Install Python (for mcp-proxy), git, curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip git curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-[Service]
-Type=simple
-User=mcp
-WorkingDirectory=/opt/mcp/gtasks-mcp
-ExecStart=${MCP_PROXY_BIN} --port 3100 -- ${NODE_BIN} /opt/mcp/gtasks-mcp/dist/index.js
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-Environment=HOME=/opt/mcp
-Environment=NODE_ENV=production
+# Install mcp-proxy — bridges stdio MCP servers to HTTP/SSE
+RUN pip install mcp-proxy --break-system-packages --quiet
 
-[Install]
-WantedBy=multi-user.target
-EOF
-msg_ok "mcp-gtasks service created"
+# Clone and build gtasks-mcp
+RUN git clone --depth=1 https://github.com/zcaceres/gtasks-mcp /opt/gtasks-mcp && \
+    cd /opt/gtasks-mcp && \
+    npm ci --silent && \
+    npm run build --silent
 
-# ── 7. nginx configuration ────────────────────────────────────────────────────
-msg_info "Configuring nginx (port 8080)"
-rm -f /etc/nginx/sites-enabled/default
+# Data directory for OAuth tokens
+RUN mkdir -p /home/mcp && useradd -d /home/mcp -s /bin/sh mcp && \
+    chown -R mcp:mcp /home/mcp /opt/gtasks-mcp
 
-cat > /etc/nginx/sites-available/mcp <<NGINXEOF
+USER mcp
+WORKDIR /opt/gtasks-mcp
+EXPOSE 3100
+
+CMD ["sh", "-c", "mcp-proxy --port 3100 -- node /opt/gtasks-mcp/dist/index.js"]
+DOCKERFILE
+msg_ok "gtasks Dockerfile created"
+
+# ── 6. nginx config ───────────────────────────────────────────────────────────
+msg_info "Creating nginx configuration"
+cat > "${HUB}/nginx/nginx.conf" <<NGINXCONF
 # MCP Hub — nginx reverse proxy
 # Managed by mcp-hub-install.sh / add-mcp-server
+# Bearer token is embedded directly (chmod 600 protects .bearer_token)
 
-server {
-    listen 8080;
-    server_name _;
+events {
+    worker_connections 1024;
+}
 
-    # ── /health — no auth ────────────────────────────────────────────────────
-    location /health {
-        add_header Content-Type application/json always;
-        return 200 '{"status":"ok","service":"mcp-hub"}';
-    }
+http {
+    # Tune for long-lived SSE connections
+    keepalive_timeout 3600;
 
-    # ── /gtasks/ → mcp-proxy on :3100 ────────────────────────────────────────
-    location /gtasks/ {
-        # Enforce bearer token
-        set \$expected_token "__BEARER_TOKEN__";
-        if (\$http_authorization != "Bearer \$expected_token") {
+    server {
+        listen 8080;
+        server_name _;
+
+        # ── /health — no auth ────────────────────────────────────────────
+        location /health {
             add_header Content-Type application/json always;
-            return 401 '{"error":"Unauthorized"}';
+            return 200 '{"status":"ok","service":"mcp-hub"}';
         }
 
-        # Strip the /gtasks prefix
-        rewrite ^/gtasks/(.*)$ /\$1 break;
+        # ── ADD NEW LOCATION BLOCKS ABOVE THIS COMMENT ──────────────────
 
-        proxy_pass         http://127.0.0.1:3100;
-        proxy_http_version 1.1;
+        # ── /gtasks/ → gtasks container on :3100 ────────────────────────
+        location /gtasks/ {
+            set \$expected_token "${BEARER_TOKEN}";
+            if (\$http_authorization != "Bearer \$expected_token") {
+                add_header Content-Type application/json always;
+                return 401 '{"error":"Unauthorized"}';
+            }
+            rewrite ^/gtasks/(.*)\$ /\$1 break;
+            proxy_pass         http://gtasks:3100;
+            proxy_http_version 1.1;
+            proxy_set_header   Upgrade           \$http_upgrade;
+            proxy_set_header   Connection        "upgrade";
+            proxy_set_header   Host              \$host;
+            proxy_set_header   X-Real-IP         \$remote_addr;
+            proxy_read_timeout  3600s;
+            proxy_send_timeout  3600s;
+            proxy_buffering     off;
+            proxy_cache         off;
+        }
 
-        # SSE / WebSocket support
-        proxy_set_header   Upgrade           \$http_upgrade;
-        proxy_set_header   Connection        "upgrade";
-        proxy_set_header   Host              \$host;
-        proxy_set_header   X-Real-IP         \$remote_addr;
-        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto \$scheme;
-
-        # Long timeouts for SSE streams
-        proxy_read_timeout  3600s;
-        proxy_send_timeout  3600s;
-        proxy_buffering     off;
-        proxy_cache         off;
-    }
-
-    # ── catch-all ─────────────────────────────────────────────────────────────
-    location / {
-        return 404;
+        # ── catch-all ────────────────────────────────────────────────────
+        location / {
+            return 404;
+        }
     }
 }
-NGINXEOF
+NGINXCONF
+msg_ok "nginx.conf created"
 
-# Inject real bearer token
-sed -i "s|__BEARER_TOKEN__|${BEARER_TOKEN}|g" /etc/nginx/sites-available/mcp
-ln -sf /etc/nginx/sites-available/mcp /etc/nginx/sites-enabled/mcp
+# ── 7. docker-compose.yml ─────────────────────────────────────────────────────
+msg_info "Creating docker-compose.yml"
+cat > "${HUB}/docker-compose.yml" <<COMPOSE
+# MCP Hub — Docker Compose stack
+# Add more servers with: add-mcp-server <name> <port> <git-url>
 
-nginx -t 2>/dev/null
-msg_ok "nginx configured (port 8080)"
+services:
 
-# ── 8. add-mcp-server helper ──────────────────────────────────────────────────
-msg_info "Installing /usr/local/bin/add-mcp-server helper"
+  # ── Reverse proxy ────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: mcp-nginx
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── ADD NEW SERVICES ABOVE THIS LINE ─────────────────────────────────────
+
+  # ── gtasks MCP server ────────────────────────────────────────────────────
+  gtasks:
+    build:
+      context: ./services/gtasks
+    container_name: mcp-gtasks
+    expose:
+      - "3100"
+    volumes:
+      - ./services/gtasks/data:/home/mcp
+    restart: unless-stopped
+    environment:
+      - HOME=/home/mcp
+      - NODE_ENV=production
+
+  # ── Cloudflare Tunnel (opt-in: docker compose --profile tunnel up -d) ───
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: mcp-cloudflared
+    command: tunnel --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+      - cloudflared-creds:/root/.cloudflared
+    restart: unless-stopped
+    profiles:
+      - tunnel
+
+volumes:
+  cloudflared-creds:
+COMPOSE
+msg_ok "docker-compose.yml created"
+
+# ── 8. Build and start the stack ──────────────────────────────────────────────
+msg_info "Building and starting MCP Hub stack (this may take a few minutes)..."
+cd "${HUB}"
+docker compose build --quiet
+docker compose up -d
+msg_ok "Stack is running"
+
+# ── 9. add-mcp-server helper ──────────────────────────────────────────────────
+msg_info "Installing /usr/local/bin/add-mcp-server"
 cat > /usr/local/bin/add-mcp-server <<'HELPEREOF'
 #!/usr/bin/env bash
-# add-mcp-server — Add a new MCP server to the hub in one command.
+# add-mcp-server — Add a new MCP server to the Docker Compose stack in one command
 #
-# Usage: add-mcp-server <name> <port> <command...>
+# Usage: add-mcp-server <name> <port> <git-url> [node-entry-point]
 #
 # Example:
-#   add-mcp-server filesystem 3101 node /opt/mcp/filesystem-mcp/dist/index.js
+#   add-mcp-server filesystem 3101 https://github.com/example/fs-mcp
 #
-# This will:
-#   - Create a systemd service called mcp-<name>
-#   - Add a location block /<name>/ to nginx with the same bearer token
-#   - Start the service immediately
+# This creates:
+#   /opt/mcp-hub/services/<name>/Dockerfile
+#   /opt/mcp-hub/services/<name>/data/
+# And updates docker-compose.yml + nginx.conf, then rebuilds.
 
 set -euo pipefail
 
-RED='\033[0;31m'; GRN='\033[0;32m'; NC='\033[0m'; BOLD='\033[1m'
+HUB="/opt/mcp-hub"
+GRN='\033[0;32m'; RED='\033[0;31m'; BOLD='\033[1m'; NC='\033[0m'
 die() { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 
 [[ $EUID -ne 0 ]] && die "Must run as root."
-[[ $# -lt 3 ]]    && die "Usage: add-mcp-server <name> <port> <command...>"
+[[ $# -lt 3 ]]    && die "Usage: add-mcp-server <name> <port> <git-url> [node-entry]"
 
 NAME="$1"
 PORT="$2"
-shift 2
-CMD="$*"
+GIT_URL="$3"
+ENTRY="${4:-dist/index.js}"
 
-BEARER_TOKEN=$(cat /opt/mcp/.bearer_token)
-MCP_PROXY_BIN=$(command -v mcp-proxy)
+BEARER_TOKEN=$(cat "${HUB}/.bearer_token")
 
-# Guard against duplicate
-if [[ -f "/etc/systemd/system/mcp-${NAME}.service" ]]; then
-  die "Service mcp-${NAME} already exists. Choose a different name."
-fi
+[[ -d "${HUB}/services/${NAME}" ]] && die "Service '${NAME}' already exists."
 
-# ── systemd service ────────────────────────────────────────────────────────────
-cat > "/etc/systemd/system/mcp-${NAME}.service" <<EOF
-[Unit]
-Description=${NAME} MCP Server (mcp-proxy → stdio bridge)
-After=network.target
+# ── Create Dockerfile ─────────────────────────────────────────────────────────
+mkdir -p "${HUB}/services/${NAME}/data"
+cat > "${HUB}/services/${NAME}/Dockerfile" <<EOF
+FROM node:20-slim
 
-[Service]
-Type=simple
-User=mcp
-ExecStart=${MCP_PROXY_BIN} --port ${PORT} -- ${CMD}
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-Environment=HOME=/opt/mcp
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+      python3 python3-pip git curl ca-certificates && \\
+    rm -rf /var/lib/apt/lists/*
 
-[Install]
-WantedBy=multi-user.target
+RUN pip install mcp-proxy --break-system-packages --quiet
+
+RUN git clone --depth=1 ${GIT_URL} /opt/${NAME} && \\
+    cd /opt/${NAME} && npm ci --silent && npm run build --silent
+
+RUN mkdir -p /home/mcp && useradd -d /home/mcp -s /bin/sh mcp && \\
+    chown -R mcp:mcp /home/mcp /opt/${NAME}
+
+USER mcp
+WORKDIR /opt/${NAME}
+EXPOSE ${PORT}
+
+CMD ["sh", "-c", "mcp-proxy --port ${PORT} -- node /opt/${NAME}/${ENTRY}"]
 EOF
 
-# ── nginx location block ───────────────────────────────────────────────────────
-# We insert the new location block just before the /health block
-NGINX_CFG="/etc/nginx/sites-available/mcp"
-
-NEW_BLOCK="
-    # ── /${NAME}/ → mcp-proxy on :${PORT} ──────────────────────────────────────────
-    location /${NAME}/ {
-        set \\\$expected_token \"${BEARER_TOKEN}\";
-        if (\\\$http_authorization != \"Bearer \\\$expected_token\") {
-            add_header Content-Type application/json always;
-            return 401 '{\"error\":\"Unauthorized\"}';
+# ── Inject nginx location block ───────────────────────────────────────────────
+NGINX_BLOCK="
+        # ── /${NAME}/ → ${NAME} container on :${PORT} ────────────────────────
+        location /${NAME}/ {
+            set \\\$expected_token \"${BEARER_TOKEN}\";
+            if (\\\$http_authorization != \"Bearer \\\$expected_token\") {
+                add_header Content-Type application/json always;
+                return 401 '{\"error\":\"Unauthorized\"}';
+            }
+            rewrite ^/${NAME}/(.*)$ /\\\$1 break;
+            proxy_pass         http://${NAME}:${PORT};
+            proxy_http_version 1.1;
+            proxy_set_header   Upgrade           \\\$http_upgrade;
+            proxy_set_header   Connection        \"upgrade\";
+            proxy_read_timeout  3600s;
+            proxy_send_timeout  3600s;
+            proxy_buffering     off;
+            proxy_cache         off;
         }
-
-        rewrite ^/${NAME}/(.*)\$ /\\\$1 break;
-        proxy_pass         http://127.0.0.1:${PORT};
-        proxy_http_version 1.1;
-        proxy_set_header   Upgrade           \\\$http_upgrade;
-        proxy_set_header   Connection        \"upgrade\";
-        proxy_set_header   Host              \\\$host;
-        proxy_read_timeout  3600s;
-        proxy_send_timeout  3600s;
-        proxy_buffering     off;
-        proxy_cache         off;
-    }
 "
+sed -i "/ADD NEW LOCATION BLOCKS ABOVE THIS COMMENT/a\\${NGINX_BLOCK}" \
+  "${HUB}/nginx/nginx.conf"
 
-# Insert before the /health block
-sed -i "/location \/health/i\\${NEW_BLOCK}" "${NGINX_CFG}"
-nginx -t && systemctl reload nginx
+# ── Inject docker-compose service ────────────────────────────────────────────
+SERVICE_BLOCK="
+  ${NAME}:
+    build:
+      context: ./services/${NAME}
+    container_name: mcp-${NAME}
+    expose:
+      - \"${PORT}\"
+    volumes:
+      - ./services/${NAME}/data:/home/mcp
+    restart: unless-stopped
+    environment:
+      - HOME=/home/mcp
+      - NODE_ENV=production
+"
+sed -i "/ADD NEW SERVICES ABOVE THIS LINE/a\\${SERVICE_BLOCK}" \
+  "${HUB}/docker-compose.yml"
 
-# ── Enable and start the new service ──────────────────────────────────────────
-systemctl daemon-reload
-systemctl enable --now "mcp-${NAME}"
+# ── Add nginx dependency ──────────────────────────────────────────────────────
+# (nginx depends_on block would need updating too; skip for simplicity —
+#  nginx will simply retry until the upstream is ready)
+
+# ── Rebuild and restart ───────────────────────────────────────────────────────
+cd "${HUB}"
+docker compose build --quiet "${NAME}"
+docker compose up -d
 
 echo ""
-echo -e "${GRN}${BOLD}✅  MCP server '${NAME}' added and started!${NC}"
+echo -e "${GRN}${BOLD}✅  MCP server '${NAME}' added!${NC}"
 echo ""
 echo -e "  Internal  : http://localhost:8080/${NAME}/sse"
 echo -e "  Token     : ${BEARER_TOKEN}"
-echo -e "  Logs      : journalctl -u mcp-${NAME} -f"
+echo -e "  Logs      : docker compose -f ${HUB}/docker-compose.yml logs -f ${NAME}"
 echo ""
 HELPEREOF
 chmod +x /usr/local/bin/add-mcp-server
 msg_ok "/usr/local/bin/add-mcp-server installed"
 
-# ── 9. Cloudflare Tunnel setup wizard ─────────────────────────────────────────
-msg_info "Installing /opt/mcp/setup-tunnel.sh wizard"
-cat > /opt/mcp/setup-tunnel.sh <<'TUNNELEOF'
+# ── 10. setup-tunnel.sh wizard ────────────────────────────────────────────────
+msg_info "Installing ${HUB}/setup-tunnel.sh"
+cat > "${HUB}/setup-tunnel.sh" <<'TUNNELEOF'
 #!/usr/bin/env bash
-# setup-tunnel.sh — Interactive Cloudflare Tunnel setup wizard
+# setup-tunnel.sh — Interactive Cloudflare Tunnel wizard (Docker edition)
 #
-# Prerequisites (run these first):
-#   cloudflared tunnel login
+# Run AFTER authenticating:
+#   docker run -it --rm \
+#     -v /opt/mcp-hub/cloudflared:/root/.cloudflared \
+#     cloudflare/cloudflared:latest tunnel login
 #
-# This script will:
-#   1. Create a named Cloudflare Tunnel
-#   2. Route DNS to a public hostname you choose
-#   3. Write /etc/cloudflared/config.yml
-#   4. Install cloudflared as a system service
+# This script then creates the tunnel, routes DNS, writes config.yml,
+# and starts the cloudflared container via docker compose.
 
 set -euo pipefail
 
-BLU='\033[0;34m'; GRN='\033[0;32m'; YLW='\033[1;33m'; NC='\033[0m'; BOLD='\033[1m'
+HUB="/opt/mcp-hub"
+BLU='\033[0;34m'; GRN='\033[0;32m'; YLW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 
 echo ""
 echo -e "${BLU}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BLU}${BOLD}  MCP Hub — Cloudflare Tunnel Setup Wizard${NC}"
+echo -e "${BLU}${BOLD}  MCP Hub — Cloudflare Tunnel Setup${NC}"
 echo -e "${BLU}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
-# Check cloudflared is authenticated
-if [[ ! -d "$HOME/.cloudflared" ]] && [[ ! -d "/root/.cloudflared" ]]; then
-  echo -e "  ${YLW}[!]${NC} It looks like you haven't logged in yet."
-  echo -e "  ${YLW}[!]${NC} Run: ${BOLD}cloudflared tunnel login${NC}"
-  echo -e "  ${YLW}[!]${NC} Then re-run this script."
+# Check credentials exist
+CREDS_DIR="${HUB}/cloudflared"
+if [[ -z "$(ls -A "${CREDS_DIR}" 2>/dev/null)" ]]; then
+  echo -e "  ${YLW}[!]${NC} No cloudflared credentials found."
+  echo -e "  ${YLW}[!]${NC} Run this first to authenticate:"
+  echo ""
+  echo -e "    docker run -it --rm \\"
+  echo -e "      -v ${CREDS_DIR}:/root/.cloudflared \\"
+  echo -e "      cloudflare/cloudflared:latest tunnel login"
+  echo ""
   exit 1
 fi
 
 read -rp "  Tunnel name     (e.g. proxmox-mcp):      " TUNNEL_NAME
 read -rp "  Public hostname (e.g. mcp.example.com):  " HOSTNAME
 
-[[ -z "${TUNNEL_NAME}" ]] && { echo "Tunnel name cannot be empty."; exit 1; }
-[[ -z "${HOSTNAME}" ]]    && { echo "Hostname cannot be empty."; exit 1; }
+[[ -z "${TUNNEL_NAME}" ]] && { echo "Tunnel name required."; exit 1; }
+[[ -z "${HOSTNAME}" ]]    && { echo "Hostname required."; exit 1; }
 
-echo ""
-echo -e "  ${BLU}[•]${NC} Creating tunnel '${TUNNEL_NAME}'..."
-cloudflared tunnel create "${TUNNEL_NAME}"
+# Create tunnel using Docker
+echo -e "\n  ${BLU}[•]${NC} Creating tunnel '${TUNNEL_NAME}'..."
+docker run --rm \
+  -v "${CREDS_DIR}:/root/.cloudflared" \
+  cloudflare/cloudflared:latest tunnel create "${TUNNEL_NAME}"
 
-TUNNEL_ID=$(cloudflared tunnel list --output json \
-  | python3 -c "import sys,json; data=json.load(sys.stdin); \
-    print(next(t['id'] for t in data if t['name']=='${TUNNEL_NAME}'))" \
-  2>/dev/null \
-  || cloudflared tunnel list --output json \
-  | jq -r --arg n "${TUNNEL_NAME}" '.[] | select(.name==$n) | .id')
+TUNNEL_ID=$(docker run --rm \
+  -v "${CREDS_DIR}:/root/.cloudflared" \
+  cloudflare/cloudflared:latest tunnel list --output json \
+  | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+name = '${TUNNEL_NAME}'
+match = next((t['id'] for t in data if t['name'] == name), None)
+print(match or '')
+")
 
-if [[ -z "${TUNNEL_ID}" ]]; then
-  echo "  Failed to retrieve tunnel ID. Check 'cloudflared tunnel list'."
-  exit 1
-fi
+[[ -z "${TUNNEL_ID}" ]] && { echo "Failed to get tunnel ID."; exit 1; }
 
-echo -e "  ${BLU}[•]${NC} Routing DNS: ${HOSTNAME} → ${TUNNEL_NAME} (${TUNNEL_ID})"
-cloudflared tunnel route dns "${TUNNEL_NAME}" "${HOSTNAME}"
+# Route DNS
+echo -e "  ${BLU}[•]${NC} Routing ${HOSTNAME} → tunnel ${TUNNEL_ID}..."
+docker run --rm \
+  -v "${CREDS_DIR}:/root/.cloudflared" \
+  cloudflare/cloudflared:latest tunnel route dns "${TUNNEL_NAME}" "${HOSTNAME}"
 
-# ── Write config ───────────────────────────────────────────────────────────────
-mkdir -p /etc/cloudflared
-
-CREDS_PATH="/root/.cloudflared/${TUNNEL_ID}.json"
-[[ ! -f "${CREDS_PATH}" ]] && CREDS_PATH="$HOME/.cloudflared/${TUNNEL_ID}.json"
-
-cat > /etc/cloudflared/config.yml <<EOF
+# Write config.yml
+cat > "${CREDS_DIR}/config.yml" <<EOF
 tunnel: ${TUNNEL_ID}
-credentials-file: ${CREDS_PATH}
+credentials-file: /root/.cloudflared/${TUNNEL_ID}.json
 logfile: /var/log/cloudflared.log
 loglevel: info
 
 ingress:
   - hostname: ${HOSTNAME}
-    service: http://localhost:8080
+    service: http://nginx:8080
   - service: http_status:404
 EOF
 
-echo -e "  ${BLU}[•]${NC} Installing cloudflared as a system service..."
-cloudflared service install
+# Start cloudflared container
+echo -e "  ${BLU}[•]${NC} Starting cloudflared container..."
+cd "${HUB}"
+docker compose --profile tunnel up -d cloudflared
 
-systemctl enable --now cloudflared 2>/dev/null || true
-
-BEARER_TOKEN=$(cat /opt/mcp/.bearer_token)
+BEARER_TOKEN=$(cat "${HUB}/.bearer_token")
 
 echo ""
 echo -e "${GRN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GRN}${BOLD}  Tunnel configured successfully!${NC}"
+echo -e "${GRN}${BOLD}  Tunnel live!${NC}"
 echo -e "${GRN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo -e "  Public endpoint : ${BOLD}https://${HOSTNAME}/gtasks/sse${NC}"
-echo -e "  Bearer token    : ${BOLD}${BEARER_TOKEN}${NC}"
+echo -e "  Endpoint  : ${BOLD}https://${HOSTNAME}/gtasks/sse${NC}"
+echo -e "  Token     : ${BOLD}${BEARER_TOKEN}${NC}"
 echo ""
-echo -e "  Add to Claude.ai:"
-echo -e "    URL   : https://${HOSTNAME}/gtasks/sse"
-echo -e "    Token : ${BEARER_TOKEN}"
-echo ""
-echo -e "  To add more MCP servers:"
-echo -e "    add-mcp-server <name> <port> <command>"
+echo -e "  Add to Claude.ai → Settings → Connectors → Add MCP Server"
 echo ""
 TUNNELEOF
-chmod +x /opt/mcp/setup-tunnel.sh
-chown mcp:mcp /opt/mcp/setup-tunnel.sh
-msg_ok "/opt/mcp/setup-tunnel.sh installed"
+chmod +x "${HUB}/setup-tunnel.sh"
+msg_ok "setup-tunnel.sh installed"
 
-# ── 10. UFW firewall ──────────────────────────────────────────────────────────
+# ── 11. UFW ────────────────────────────────────────────────────────────────────
 msg_info "Configuring UFW firewall"
 ufw --force reset    &>/dev/null
 ufw default deny incoming &>/dev/null
 ufw default allow outgoing &>/dev/null
-ufw allow ssh         comment "SSH access"     &>/dev/null
-ufw allow 8080/tcp    comment "MCP nginx proxy" &>/dev/null
+ufw allow ssh         comment "SSH"           &>/dev/null
+ufw allow 8080/tcp    comment "MCP nginx"     &>/dev/null
 ufw --force enable    &>/dev/null
-msg_ok "UFW configured (SSH + 8080 allowed, all else denied)"
-
-# ── 11. Enable and start services ─────────────────────────────────────────────
-msg_info "Enabling and starting services"
-systemctl daemon-reload
-systemctl enable --now mcp-gtasks &>/dev/null
-systemctl enable --now nginx      &>/dev/null
-msg_ok "Services mcp-gtasks and nginx enabled and started"
+msg_ok "UFW: SSH + 8080 allowed, everything else denied"
 
 # ── 12. Post-install summary ──────────────────────────────────────────────────
-msg_info "Writing post-install summary"
-
+msg_info "Writing summary"
 CT_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<this-ip>")
-BEARER_TOKEN=$(cat /opt/mcp/.bearer_token)
+BEARER_TOKEN=$(cat "${HUB}/.bearer_token")
 
 cat > /root/mcp-hub-info.txt <<EOF
 ╔══════════════════════════════════════════════════════════════╗
-║                MCP Hub — Post-Install Summary                ║
+║           MCP Hub (Docker) — Post-Install Summary            ║
 ╚══════════════════════════════════════════════════════════════╝
 
-Bearer Token (keep this secret — required for all MCP connections):
+Bearer Token  (keep secret):
   ${BEARER_TOKEN}
 
-Internal MCP Endpoint (gtasks):
+Internal endpoint (gtasks):
   http://${CT_IP}:8080/gtasks/sse
 
-Health Check (no auth required):
+Health check (no auth):
   curl http://${CT_IP}:8080/health
+
+Docker stack status:
+  docker compose -f ${HUB}/docker-compose.yml ps
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 NEXT STEPS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-── Step 1: Google OAuth Setup ──────────────────────────────────
+── Step 1: Google OAuth ─────────────────────────────────────────
 
-  a) Go to https://console.cloud.google.com/
-  b) Create/select a project, enable the Google Tasks API
-  c) Create OAuth 2.0 credentials (Desktop application)
-  d) Download the credentials JSON file
+  a) Google Cloud Console → Enable Tasks API → Create OAuth 2.0
+     credentials (Desktop app) → Download JSON
 
-  e) Copy the file into the container:
-       scp gcp-oauth.keys.json root@${CT_IP}:/opt/mcp/gtasks-mcp/gcp-oauth.keys.json
+  b) Copy into the container:
+       scp gcp-oauth.keys.json root@${CT_IP}:/opt/mcp-hub/services/gtasks/data/
 
-  f) Run the auth flow (inside this container):
-       cd /opt/mcp/gtasks-mcp && sudo -u mcp node dist/index.js auth
+  c) Run auth flow inside the running container:
+       docker exec -it mcp-gtasks sh -c \
+         "node /opt/gtasks-mcp/dist/index.js auth"
 
-── Step 2: Cloudflare Tunnel Login ─────────────────────────────
+── Step 2: Cloudflare Tunnel ────────────────────────────────────
 
-  a) Inside this container, run:
-       cloudflared tunnel login
-  b) Open the URL shown in your browser and authorise the zone/domain
+  a) Authenticate (opens a browser link):
+       docker run -it --rm \\
+         -v /opt/mcp-hub/cloudflared:/root/.cloudflared \\
+         cloudflare/cloudflared:latest tunnel login
 
-── Step 3: Create and configure the tunnel ─────────────────────
+  b) Run the setup wizard:
+       /opt/mcp-hub/setup-tunnel.sh
 
-  Run the interactive wizard:
-    /opt/mcp/setup-tunnel.sh
+── Step 3: Add connector in Claude.ai ──────────────────────────
 
-  It will ask for:
-    - Tunnel name  (e.g. proxmox-mcp)
-    - Public hostname (e.g. mcp.yourdomain.com)
+  Go to Claude.ai → Settings → Connectors → Add MCP Server
+    URL   : https://<your-hostname>/gtasks/sse
+    Token : ${BEARER_TOKEN}
 
-  It then creates the tunnel, routes DNS, writes
-  /etc/cloudflared/config.yml, and installs the system service.
+── Adding more MCP servers ──────────────────────────────────────
 
-── Step 4: Add the connector in Claude.ai ──────────────────────
-
-  1. Go to Claude.ai → Settings → Connectors → Add MCP Server
-  2. Enter:
-       URL   : https://<your-hostname>/gtasks/sse
-       Token : ${BEARER_TOKEN}
-  3. Click Connect and authorise
-
-── Adding More MCP Servers Later ───────────────────────────────
-
-  add-mcp-server <name> <port> <command>
+  add-mcp-server <name> <port> <git-url>
 
   Example:
-    add-mcp-server filesystem 3101 node /opt/mcp/fs-mcp/dist/index.js
+    add-mcp-server filesystem 3101 https://github.com/example/fs-mcp
 
-  This creates the systemd service and injects the nginx location
-  block automatically.
+── Stack management ─────────────────────────────────────────────
 
-── Service Management ───────────────────────────────────────────
+  cd /opt/mcp-hub
 
-  systemctl status mcp-gtasks
-  systemctl status nginx
-  systemctl status cloudflared
+  docker compose ps
+  docker compose logs -f gtasks
+  docker compose logs -f nginx
+  docker compose restart gtasks
 
-  journalctl -u mcp-gtasks -f
-  journalctl -u cloudflared -f
-
-  nginx -t && systemctl reload nginx
+  # Rebuild after code changes:
+  docker compose build gtasks && docker compose up -d gtasks
 
 ══════════════════════════════════════════════════════════════════
 EOF
-
 chmod 600 /root/mcp-hub-info.txt
 msg_ok "Summary written to /root/mcp-hub-info.txt"
 
-# ── Final status banner ───────────────────────────────────────────────────────
+# ── Done ───────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GRN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GRN}${BOLD}  MCP Hub installation complete!${NC}"
+echo -e "${GRN}${BOLD}  MCP Hub Docker stack is up!${NC}"
 echo -e "${GRN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo -e "  Container IP  : ${BOLD}${CT_IP}${NC}"
-echo -e "  Health check  : ${CYN}curl http://${CT_IP}:8080/health${NC}"
-echo -e "  Bearer token  : ${BOLD}${BEARER_TOKEN}${NC}"
+echo -e "  ${CYN}docker compose -f ${HUB}/docker-compose.yml ps${NC}"
 echo ""
-echo -e "  Full next steps: ${CYN}cat /root/mcp-hub-info.txt${NC}"
+cd "${HUB}" && docker compose ps
+echo ""
+echo -e "  Bearer token : ${BOLD}${BEARER_TOKEN}${NC}"
+echo -e "  Health check : ${CYN}curl http://${CT_IP}:8080/health${NC}"
+echo -e "  Full guide   : ${CYN}cat /root/mcp-hub-info.txt${NC}"
 echo ""
